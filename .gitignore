@@ -3,3 +3,11 @@ venv/
 ENV/
 .env
 .env.*
+# virtual env
+.venv/
+venv/
+ENV/
+
+# env files
+.env
+.env.*
