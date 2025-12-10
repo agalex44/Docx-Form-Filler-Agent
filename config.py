@@ -18,8 +18,8 @@ OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 SITE_URL = os.getenv("SITE_URL", "")
 SITE_NAME = os.getenv("SITE_NAME", "")
 
-# Model selection - QWEN 8B
-MODEL_NAME = os.getenv("MODEL_NAME", "qwen/qwen3-embedding-8b")
+# FIXED: Using CHAT model, not embedding model
+MODEL_NAME = os.getenv("MODEL_NAME", "openai/gpt-5.1")
 
 # Generation configuration
 GENERATION_CONFIG = {
@@ -33,9 +33,13 @@ GENERATION_CONFIG = {
 # ============================================================================
 
 MAX_RETRIES = 3
-CONFIDENCE_THRESHOLD = 0.8
-FUZZY_MATCH_THRESHOLD = 80
-MAX_PLACEHOLDERS_PER_REQUEST = 100
+CONFIDENCE_THRESHOLD = 0.75  # More strict
+FUZZY_MATCH_THRESHOLD = 85   # More strict
+MAX_PLACEHOLDERS_PER_REQUEST = 30  # Reduced for better accuracy
+
+# Context window for placeholder detection
+CONTEXT_CHARS_BEFORE = 200  # Increased
+CONTEXT_CHARS_AFTER = 50
 
 # ============================================================================
 # File Configuration
@@ -55,6 +59,7 @@ RUN_UNICODE_CHECK = True
 # ============================================================================
 
 VERBOSE = True
+DEBUG_MODE = True  # Enable detailed logging
 LOG_FILE = "docx_filler.log"
 
 # ============================================================================

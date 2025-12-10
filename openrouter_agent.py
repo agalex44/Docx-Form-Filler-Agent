@@ -1,51 +1,42 @@
 # -*- coding: utf-8 -*-
 """
-DOCX Form Filler Agent with OpenRouter + QWEN 8B
+DOCX Form Filler - FIXED: Match labels, not patterns
 """
 
 import json
 import re
 import unicodedata
-from typing import Dict, List, Tuple, Optional, Any
+from typing import Dict, List, Tuple, Optional
 from pathlib import Path
 from docx import Document
 from rapidfuzz import fuzz
 from pydantic import BaseModel, Field
-
 from openai import OpenAI
+
 from config import (
-    OPENROUTER_API_KEY,
-    OPENROUTER_BASE_URL,
-    MODEL_NAME,
-    GENERATION_CONFIG,
-    CONFIDENCE_THRESHOLD,
-    FUZZY_MATCH_THRESHOLD,
-    SITE_URL,
-    SITE_NAME
+    OPENROUTER_API_KEY, OPENROUTER_BASE_URL, MODEL_NAME,
+    GENERATION_CONFIG, CONFIDENCE_THRESHOLD, DEBUG_MODE
 )
 
 # ============================================================================
-# Data Models
+# Models
 # ============================================================================
 
 class FieldMapping(BaseModel):
-    placeholder: str = Field(description="Placeholder text from document")
-    matched_field: str = Field(description="JSON field name to map")
-    confidence: float = Field(description="Confidence score 0-1")
+    label: str = Field(description="Label text before placeholder")
+    json_key: str = Field(description="Exact JSON key")
+    confidence: float = Field(ge=0.0, le=1.0)
 
-class FieldMappingResponse(BaseModel):
-    mappings: List[FieldMapping] = Field(description="List of field mappings")
-    total_mapped: int = Field(description="Total count of mapped fields")
+class MappingResponse(BaseModel):
+    mappings: List[FieldMapping]
 
 # ============================================================================
-# Input Processing
+# Input Normalizer
 # ============================================================================
 
 class InputNormalizer:
-    """Normalize and load input data from various formats"""
-    
     @staticmethod
-    def normalize_text(text: Any) -> str:
+    def normalize_text(text) -> str:
         if text is None:
             return ""
         if not isinstance(text, str):
@@ -56,183 +47,175 @@ class InputNormalizer:
     def load_json(file_path: str) -> Dict[str, str]:
         with open(file_path, 'r', encoding='utf-8') as f:
             data = json.load(f)
-        return {
-            InputNormalizer.normalize_text(k): InputNormalizer.normalize_text(v)
-            for k, v in data.items()
-        }
-    
-    @staticmethod
-    def auto_load(file_path: str) -> Dict[str, str]:
-        ext = Path(file_path).suffix.lower()
-        if ext == '.json':
-            return InputNormalizer.load_json(file_path)
-        raise ValueError(f"Unsupported format: {ext}")
+        
+        normalized = {}
+        for k, v in data.items():
+            if isinstance(v, (list, dict)):
+                v = json.dumps(v, ensure_ascii=False)
+            normalized[InputNormalizer.normalize_text(k)] = InputNormalizer.normalize_text(v)
+        
+        return normalized
 
 # ============================================================================
-# Placeholder Detection
+# Placeholder Detector - Extract LABEL + PLACEHOLDER
 # ============================================================================
 
 class PlaceholderDetector:
-    """Detect placeholders in DOCX documents"""
-    
     PATTERNS = {
         'underscores': re.compile(r'_{5,}'),
         'dots': re.compile(r'\.{4,}'),
-        'brackets': re.compile(r'\{[^}]+\}'),
     }
     
     @staticmethod
-    def extract_from_paragraphs(paragraphs) -> List[Tuple[str, str, Any]]:
-        placeholders = []
-        for para in paragraphs:
+    def extract_label_and_placeholder(text: str, match) -> Tuple[str, str]:
+        """Extract label before placeholder"""
+        placeholder = match.group()
+        
+        # Get text before placeholder (up to 150 chars)
+        before_text = text[:match.start()]
+        label = before_text[-150:].strip() if len(before_text) > 0 else ""
+        
+        # Clean label: keep last sentence/phrase
+        if ':' in label:
+            label = label.split(':')[-1].strip()
+        elif ',' in label:
+            label = label.split(',')[-1].strip()
+        
+        return label, placeholder
+    
+    @staticmethod
+    def extract_all(doc: Document) -> List[Tuple[str, str, any]]:
+        """Returns: [(label, placeholder, paragraph_obj)]"""
+        results = []
+        
+        for para in doc.paragraphs:
             text = para.text
             for pattern in PlaceholderDetector.PATTERNS.values():
                 for match in pattern.finditer(text):
-                    # Extract context (100 chars before/after)
-                    start = max(0, match.start() - 100)
-                    end = min(len(text), match.end() + 100)
-                    context = text[start:end].strip()
-                    placeholders.append((match.group(), context, para))
-        return placeholders
-    
-    @staticmethod
-    def extract_all(doc: Document) -> List[Tuple[str, str, Any]]:
-        placeholders = PlaceholderDetector.extract_from_paragraphs(doc.paragraphs)
+                    label, placeholder = PlaceholderDetector.extract_label_and_placeholder(text, match)
+                    results.append((label, placeholder, para))
         
-        # Extract from tables
-        for table in doc.tables or []:
+        # Tables
+        for table in doc.tables:
             for row in table.rows:
                 for cell in row.cells:
-                    placeholders.extend(
-                        PlaceholderDetector.extract_from_paragraphs(cell.paragraphs)
-                    )
-        return placeholders
+                    for para in cell.paragraphs:
+                        text = para.text
+                        for pattern in PlaceholderDetector.PATTERNS.values():
+                            for match in pattern.finditer(text):
+                                label, placeholder = PlaceholderDetector.extract_label_and_placeholder(text, match)
+                                results.append((label, placeholder, para))
+        
+        return results
 
 # ============================================================================
-# OpenRouter LLM Mapper
+# LLM Mapper - Match LABELS to JSON KEYS
 # ============================================================================
 
 class OpenRouterMapper:
-    """Map placeholders to JSON fields using OpenRouter + QWEN"""
-    
     def __init__(self):
         self.client = OpenAI(
             base_url=OPENROUTER_BASE_URL,
             api_key=OPENROUTER_API_KEY,
         )
         self.model = MODEL_NAME
-        self.extra_headers = {}
-        
-        if SITE_URL:
-            self.extra_headers["HTTP-Referer"] = SITE_URL
-        if SITE_NAME:
-            self.extra_headers["X-Title"] = SITE_NAME
     
-    def map_fields(
-        self,
-        json_keys: List[str],
-        placeholders: List[Tuple[str, str, Any]]
-    ) -> Dict[str, str]:
-        """Map JSON fields to document placeholders using QWEN"""
+    def map_labels_to_keys(self, json_keys: List[str], labels: List[str]) -> Dict[str, str]:
+        """Map document labels to JSON keys"""
         
-        # Prepare sample data (limit to avoid token overflow)
-        sample_placeholders = [
-            {"placeholder": ph, "context": ctx}
-            for ph, ctx, _ in placeholders[:50]
-        ]
-        
-        system_prompt = f"""You are an expert at mapping JSON fields to document placeholders.
+        system_prompt = """You are mapping Romanian document labels to JSON field names.
 
-Given:
-- JSON FIELDS: {json.dumps(json_keys, ensure_ascii=False)}
-- DOCUMENT PLACEHOLDERS: {json.dumps(sample_placeholders, ensure_ascii=False)}
+TASK: Match each label (text before blank) to the correct JSON key.
 
-Task: Match each placeholder to the most appropriate JSON field based on context.
+RULES:
+1. Match by semantic meaning
+2. Handle Romanian: "numele" = name, "adresa" = address, "data" = date
+3. Be specific: "Data completării" → "Data completarii" (exact match)
+4. Return confidence >0.99 only
+5. One label = one JSON key
+6. Ensure you are not destroying the document/the format.
+7. Fit the size of the text in the places where it doesn't directly fit, don't change the dots or date lines but fit the text just above or in between.
 
-Return ONLY valid JSON in this format:
-{{
-    "mappings": [
-        {{"placeholder": "____", "matched_field": "field_name", "confidence": 0.95}}
-    ],
-    "total_mapped": 5
-}}
+RESPONSE FORMAT (JSON only):
+{
+  "mappings": [
+    {"label": "CIF", "json_key": "CIF", "confidence": 0.95}
+  ]
+}"""
 
-Rules:
-1. Only include mappings with confidence > 0.7
-2. Match based on semantic meaning in context
-3. Handle Romanian text and diacritics
-4. Return valid JSON only, no explanations"""
+        user_prompt = f"""JSON KEYS:
+{json.dumps(json_keys, ensure_ascii=False)}
+
+DOCUMENT LABELS:
+{json.dumps(labels[:40], ensure_ascii=False)}
+
+Map labels to keys."""
 
         try:
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=[
                     {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": "Create the mapping now."}
+                    {"role": "user", "content": user_prompt}
                 ],
-                temperature=GENERATION_CONFIG["temperature"],
-                top_p=GENERATION_CONFIG["top_p"],
-                max_tokens=GENERATION_CONFIG["max_tokens"],
-                extra_headers=self.extra_headers
+                temperature=0.0,
+                max_tokens=4096
             )
             
-            # Parse response
             content = response.choices[0].message.content.strip()
-            
-            # Clean markdown code blocks if present
-            content = re.sub(r'^```json\s*|\s*```$', '', content, flags=re.MULTILINE)
+            content = re.sub(r'^```(?:json)?\s*|\s*```$', '', content, flags=re.MULTILINE | re.DOTALL)
             
             data = json.loads(content)
-            mapping_obj = FieldMappingResponse(**data)
+            mapping_obj = MappingResponse(**data)
             
-            # Build valid mapping dictionary
-            valid_mapping = {}
-            for fm in mapping_obj.mappings:
-                if fm.matched_field in json_keys and fm.confidence > CONFIDENCE_THRESHOLD:
-                    valid_mapping[fm.placeholder] = fm.matched_field
+            result = {}
+            for m in mapping_obj.mappings:
+                if m.json_key in json_keys and m.confidence >= CONFIDENCE_THRESHOLD:
+                    result[m.label] = m.json_key
+                    if DEBUG_MODE:
+                        print(f"[MAP] '{m.label}' → '{m.json_key}' ({m.confidence:.2f})")
             
-            print(f"  ✓ OpenRouter mapped {len(valid_mapping)} fields")
-            return valid_mapping
+            print(f"✓ Mapped {len(result)}/{len(labels[:40])} labels")
+            return result
             
         except Exception as e:
-            print(f"  ⚠ OpenRouter failed: {e}. Using fuzzy fallback.")
+            print(f"⚠ LLM failed: {e}")
             return {}
 
 # ============================================================================
-# Fuzzy Matcher (Fallback)
+# Fuzzy Matcher for Fallback
 # ============================================================================
 
 class FuzzyMatcher:
-    """Fuzzy matching fallback for unmapped fields"""
-    
-    ROMANIAN_DIACRITICS = {
+    DIACRITICS = {
         'ă': 'a', 'â': 'a', 'î': 'i', 'ș': 's', 'ț': 't',
         'Ă': 'A', 'Â': 'A', 'Î': 'I', 'Ș': 'S', 'Ț': 'T'
     }
     
     @staticmethod
-    def normalize_romanian(text: str) -> str:
+    def normalize(text: str) -> str:
         text = text.lower()
-        for old, new in FuzzyMatcher.ROMANIAN_DIACRITICS.items():
+        for old, new in FuzzyMatcher.DIACRITICS.items():
             text = text.replace(old, new.lower())
         return text
     
     @staticmethod
-    def match(
-        placeholder_context: str,
-        json_keys: List[str],
-        threshold: int = FUZZY_MATCH_THRESHOLD
-    ) -> Optional[str]:
-        norm_context = FuzzyMatcher.normalize_romanian(placeholder_context)
+    def match(label: str, json_keys: List[str]) -> Optional[str]:
+        if not label or len(label) < 3:
+            return None
+        
+        norm_label = FuzzyMatcher.normalize(label)
         best_match, best_score = None, 0
         
         for key in json_keys:
-            norm_key = FuzzyMatcher.normalize_romanian(key)
+            norm_key = FuzzyMatcher.normalize(key)
             score = max(
-                fuzz.partial_ratio(norm_context, norm_key),
-                fuzz.token_sort_ratio(norm_context, norm_key)
+                fuzz.ratio(norm_label, norm_key),
+                fuzz.partial_ratio(norm_label, norm_key),
+                fuzz.token_sort_ratio(norm_label, norm_key)
             )
-            if score > best_score and score >= threshold:
+            
+            if score > best_score and score >= 85:
                 best_score, best_match = score, key
         
         return best_match
@@ -242,49 +225,43 @@ class FuzzyMatcher:
 # ============================================================================
 
 class DocxRenderer:
-    """Replace placeholders in DOCX while preserving formatting"""
-    
     @staticmethod
     def replace_in_paragraph(para, placeholder: str, value: str) -> bool:
         full_text = para.text
         if placeholder not in full_text:
             return False
         
-        # Handle multi-line values
         if '\n' in value:
             value = value.replace('\n', ' ')
         
-        placeholder_start = full_text.find(placeholder)
+        # Find placeholder and replace
+        new_text = full_text.replace(placeholder, value, 1)
         
-        # Find affected runs
-        affected_runs = []
-        current_pos = 0
+        # Replace in first run to preserve formatting
+        if para.runs:
+            para.runs[0].text = new_text
+            # Clear other runs
+            for run in para.runs[1:]:
+                run.text = ""
+            return True
         
-        for i, run in enumerate(para.runs):
-            run_start = current_pos
-            run_end = current_pos + len(run.text)
-            
-            if run_start < placeholder_start + len(placeholder) and run_end > placeholder_start:
-                affected_runs.append((i, run_start, run_end, run))
-            current_pos = run_end
-        
-        if not affected_runs:
-            return False
-        
-        # Replace in first run (preserves formatting best)
-        first_run_idx, first_start, _, first_run = affected_runs[0]
-        before = full_text[:placeholder_start]
-        after = full_text[placeholder_start + len(placeholder):]
-        first_run.text = before + value + after
-        
-        return True
+        return False
     
     @staticmethod
-    def fill_all_occurrences(doc: Document, placeholder: str, value: str) -> int:
+    def fill_all(doc: Document, placeholder: str, value: str) -> int:
         count = 0
+        
         for para in doc.paragraphs:
             if DocxRenderer.replace_in_paragraph(para, placeholder, value):
                 count += 1
+        
+        for table in doc.tables:
+            for row in table.rows:
+                for cell in row.cells:
+                    for para in cell.paragraphs:
+                        if DocxRenderer.replace_in_paragraph(para, placeholder, value):
+                            count += 1
+        
         return count
 
 # ============================================================================
@@ -292,8 +269,6 @@ class DocxRenderer:
 # ============================================================================
 
 class DocxFormFillerAgent:
-    """Main agent orchestrating the form filling process"""
-    
     def __init__(self, use_llm: bool = True):
         self.normalizer = InputNormalizer()
         self.detector = PlaceholderDetector()
@@ -301,95 +276,104 @@ class DocxFormFillerAgent:
         self.fuzzy_matcher = FuzzyMatcher()
         self.renderer = DocxRenderer()
     
-    def process(
-        self,
-        docx_path: str,
-        data_path: str,
-        output_path: str,
-        verbose: bool = True
-    ) -> Dict[str, Any]:
-        """Process document and fill placeholders"""
-        
+    def process(self, docx_path: str, data_path: str, output_path: str, verbose: bool = True):
         stats = {
             "total_placeholders": 0,
-            "filled_placeholders": 0,
-            "llm_mappings": 0,
-            "fuzzy_mappings": 0,
+            "filled": 0,
+            "llm_mapped": 0,
+            "fuzzy_mapped": 0,
             "unmapped": 0
         }
         
         if verbose:
-            print("=" * 60)
-            print("DOCX FORM FILLER - OpenRouter + QWEN")
-            print("=" * 60)
+            print("=" * 70)
+            print("DOCX FORM FILLER - Label Matching")
+            print("=" * 70)
         
-        # 1. Load data
-        data = self.normalizer.auto_load(data_path)
+        # 1. Load JSON data
+        data = self.normalizer.load_json(data_path)
         if verbose:
-            print(f"[1/5] ✓ Loaded {len(data)} fields")
+            print(f"[1/5] ✓ Loaded {len(data)} JSON fields")
         
         # 2. Load document
         doc = Document(docx_path)
         if verbose:
-            print("[2/5] ✓ Document loaded")
+            print(f"[2/5] ✓ Loaded document")
         
-        # 3. Detect placeholders
-        placeholders = self.detector.extract_all(doc)
-        stats["total_placeholders"] = len(placeholders)
+        # 3. Extract labels + placeholders
+        extractions = self.detector.extract_all(doc)
+        stats["total_placeholders"] = len(extractions)
+        
+        # Group by label
+        label_groups = {}
+        for label, placeholder, para in extractions:
+            if label not in label_groups:
+                label_groups[label] = []
+            label_groups[label].append((placeholder, para))
+        
         if verbose:
-            print(f"[3/5] ✓ Found {len(placeholders)} placeholders")
+            print(f"[3/5] ✓ Found {len(extractions)} placeholders ({len(label_groups)} unique labels)")
+            if DEBUG_MODE:
+                print(f"[DEBUG] Sample labels: {list(label_groups.keys())[:5]}")
         
-        # Group placeholders
-        placeholder_groups = {}
-        for ph, ctx, obj in placeholders:
-            placeholder_groups.setdefault(ph, []).append((ctx, obj))
+        # 4. Map labels to JSON keys
+        label_to_key = {}
         
-        # 4. Map with OpenRouter
-        llm_mapping = {}
         if self.llm_mapper:
-            llm_mapping = self.llm_mapper.map_fields(list(data.keys()), placeholders)
-            stats["llm_mappings"] = len(llm_mapping)
+            if verbose:
+                print("[4/5] Mapping with LLM...")
+            label_to_key = self.llm_mapper.map_labels_to_keys(
+                list(data.keys()),
+                list(label_groups.keys())
+            )
+            stats["llm_mapped"] = len(label_to_key)
         
         # 5. Fill document
         if verbose:
-            print("[4/5] Filling placeholders...")
+            print("[5/5] Filling...")
         
-        for placeholder_text, occurrences in placeholder_groups.items():
-            context, _ = occurrences[0]
-            matched_key = None
+        for label, placeholders in label_groups.items():
+            json_key = None
+            source = None
             
-            # Try LLM mapping first
-            for mapped_ph, field in llm_mapping.items():
-                if mapped_ph in placeholder_text or placeholder_text in mapped_ph:
-                    matched_key = field
-                    break
+            # Try LLM mapping
+            if label in label_to_key:
+                json_key = label_to_key[label]
+                source = "LLM"
             
             # Fuzzy fallback
-            if not matched_key:
-                matched_key = self.fuzzy_matcher.match(context, list(data.keys()))
-                if matched_key:
-                    stats["fuzzy_mappings"] += 1
+            if not json_key:
+                json_key = self.fuzzy_matcher.match(label, list(data.keys()))
+                if json_key:
+                    source = "FUZZY"
+                    stats["fuzzy_mapped"] += 1
             
-            if matched_key and matched_key in data:
-                value = data[matched_key]
-                count = self.renderer.fill_all_occurrences(doc, placeholder_text, value)
-                stats["filled_placeholders"] += count
+            # Fill if matched
+            if json_key and json_key in data:
+                value = data[json_key]
+                
+                for placeholder, para in placeholders:
+                    if self.renderer.replace_in_paragraph(para, placeholder, value):
+                        stats["filled"] += 1
+                
                 if verbose:
-                    print(f"  ✓ [{count}x] {placeholder_text[:30]}... → {matched_key[:30]}")
+                    print(f"  ✓ [{source}] '{label[:30]}...' → '{json_key[:30]}' = '{value[:30]}'")
             else:
                 stats["unmapped"] += 1
+                if DEBUG_MODE and label.strip():
+                    print(f"  ✗ UNMAPPED: '{label[:50]}'")
         
-        # 6. Save
+        # Save
         doc.save(output_path)
         if verbose:
-            print(f"[5/5] ✓ Saved: {output_path}")
-        
-        if verbose:
-            print("\n" + "=" * 60)
+            print(f"✓ Saved: {output_path}")
+            print("\n" + "=" * 70)
             print("SUMMARY")
-            print("=" * 60)
+            print("=" * 70)
             for k, v in stats.items():
-                print(f"{k}: {v}")
-            print("=" * 60)
+                print(f"{k:.<30} {v}")
+            fill_rate = (stats["filled"] / stats["total_placeholders"] * 100) if stats["total_placeholders"] > 0 else 0
+            print(f"{'Fill rate':.<30} {fill_rate:.1f}%")
+            print("=" * 70)
         
         return stats
