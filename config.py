@@ -1,5 +1,5 @@
 """
-Configuration for DOCX Form Filler Agent with OpenRouter
+Configuration for Deterministic DOCX Filler v2.0
 """
 
 import os
@@ -8,65 +8,47 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ============================================================================
-# OpenRouter Configuration
-# ============================================================================
-
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "REPLACE_WITH_YOUR_KEY")
-OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-
-# Optional: For rankings on openrouter.ai (leave empty if not needed)
-SITE_URL = os.getenv("SITE_URL", "")
-SITE_NAME = os.getenv("SITE_NAME", "")
-
-# FIXED: Using CHAT model, not embedding model
-MODEL_NAME = os.getenv("MODEL_NAME", "openai/gpt-5.1")
-
-# Generation configuration
-GENERATION_CONFIG = {
-    "temperature": 0.0,           # Deterministic
-    "top_p": 0.95,
-    "max_tokens": 8192,
-}
-
-# ============================================================================
-# Processing Configuration
-# ============================================================================
-
-MAX_RETRIES = 3
-CONFIDENCE_THRESHOLD = 0.75  # More strict
-FUZZY_MATCH_THRESHOLD = 85   # More strict
-MAX_PLACEHOLDERS_PER_REQUEST = 30  # Reduced for better accuracy
-
-# Context window for placeholder detection
-CONTEXT_CHARS_BEFORE = 200  # Increased
-CONTEXT_CHARS_AFTER = 50
-
-# ============================================================================
-# File Configuration
+# File Paths
 # ============================================================================
 
 INPUT_DOCX_PATH = "sample_forms.docx"
 INPUT_DATA_PATH = "input_date.json"
 OUTPUT_DOCX_PATH = "sample_forms.filled.docx"
 
-# Validation settings
-RUN_DETERMINISM_CHECK = True
-DETERMINISM_RUNS = 3
-RUN_UNICODE_CHECK = True
-
 # ============================================================================
-# Logging Configuration
+# Matching Configuration
 # ============================================================================
 
+# Fuzzy matching threshold (0.0 to 1.0)
+# 0.85 = good balance between accuracy and coverage
+# 0.90 = stricter, may miss some valid matches
+# 0.80 = more lenient, may include false positives
+FUZZY_THRESHOLD = 0.85
+
+# ============================================================================
+# Processing Options
+# ============================================================================
+
+# Show detailed output
 VERBOSE = True
-DEBUG_MODE = True  # Enable detailed logging
-LOG_FILE = "docx_filler.log"
+
+# Validation runs for determinism check
+DETERMINISM_CHECK_ENABLED = False
+DETERMINISM_RUNS = 3
 
 # ============================================================================
-# Feature Flags
+# Advanced Options
 # ============================================================================
 
-USE_LLM = True
-USE_FUZZY_FALLBACK = True
-PRESERVE_FORMATTING = True
-HANDLE_ARRAYS = True
+# Handle array/list values in JSON
+FORMAT_ARRAYS = True  # Convert ["a", "b"] to "a, b"
+
+# Preserve empty placeholders if no match found
+PRESERVE_EMPTY_PLACEHOLDERS = True
+
+# ============================================================================
+# Logging
+# ============================================================================
+
+LOG_FILE = "docx_filler_v2.log"
+LOG_LEVEL = "INFO"  # DEBUG, INFO, WARNING, ERROR
